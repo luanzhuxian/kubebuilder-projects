@@ -14,6 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// 实现了两大功能：默认值设置（Defaulter） 和 字段验证（Validator）
+// 这个 webhook 文件的作用是：
+// 	•	Defaulter 自动为新建或更新的 CronJob 对象补齐默认值
+// 	•	Validator 在 create/update/delete 操作时，检查字段合法性，防止非法 Cron 表达式或名字过长等错误
+
 package v1
 
 import (
@@ -39,6 +44,13 @@ import (
 // log is for logging in this package.
 var cronjoblog = logf.Log.WithName("cronjob-resource")
 
+// 1. Webhook 注册入口函数
+// 这是 webhook 的注册入口：
+// 	•	绑定资源：For(&batchv1.CronJob{})
+// 	•	注册两个处理器：
+// 	•	WithValidator()：用于验证
+// 	•	WithDefaulter()：用于填充默认值
+
 // SetupCronJobWebhookWithManager registers the webhook for CronJob in the manager.
 func SetupCronJobWebhookWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewWebhookManagedBy(mgr).For(&batchv1.CronJob{}).
@@ -51,6 +63,7 @@ func SetupCronJobWebhookWithManager(mgr ctrl.Manager) error {
 		}).
 		Complete()
 }
+
 
 // TODO(user): EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 
@@ -71,6 +84,16 @@ type CronJobCustomDefaulter struct {
 }
 
 var _ webhook.CustomDefaulter = &CronJobCustomDefaulter{}
+
+// 2. 默认值设置逻辑（Defaulter）
+// 当 CronJob 资源被创建或更新时，会调用 Default 方法，设置默认值。
+// 判断对象是否是 *CronJob
+// 调用 applyDefaults 为 4 个字段设置默认值（若原值为零值）
+// 默认值包括：
+// 	•	ConcurrencyPolicy：AllowConcurrent
+// 	•	Suspend：false
+// 	•	SuccessfulJobsHistoryLimit：3
+// 	•	FailedJobsHistoryLimit：1
 
 // Default implements webhook.CustomDefaulter so a webhook will be registered for the Kind CronJob.
 func (d *CronJobCustomDefaulter) Default(_ context.Context, obj runtime.Object) error {
@@ -120,6 +143,13 @@ type CronJobCustomValidator struct {
 }
 
 var _ webhook.CustomValidator = &CronJobCustomValidator{}
+
+
+// 3. 验证逻辑（Validator）
+// 通过实现 webhook.CustomValidator 接口的 3 个方法来进行验证：create/update/delete 的验证统一走 validateCronJob
+// •	ValidateCreate：验证创建时 CronJob 的各个字段
+// •	ValidateUpdate：验证更新时 CronJob 的各个字段
+// •	ValidateDelete：验证删除时 CronJob 的各个字段
 
 // ValidateCreate implements webhook.CustomValidator so a webhook will be registered for the type CronJob.
 func (v *CronJobCustomValidator) ValidateCreate(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
@@ -180,6 +210,7 @@ func validateCronJobSpec(cronjob *batchv1.CronJob) *field.Error {
 		field.NewPath("spec").Child("schedule"))
 }
 
+// 验证 CronJob 的 Schedule 字段是否符合 cron 表达式格式
 func validateScheduleFormat(schedule string, fldPath *field.Path) *field.Error {
 	if _, err := cron.ParseStandard(schedule); err != nil {
 		return field.Invalid(fldPath, schedule, err.Error())
@@ -187,6 +218,7 @@ func validateScheduleFormat(schedule string, fldPath *field.Path) *field.Error {
 	return nil
 }
 
+// 验证 CronJob 的 Name 字段是否符合 DNS 子域名格式 验证名称长度（<= 52）
 func validateCronJobName(cronjob *batchv1.CronJob) *field.Error {
 	if len(cronjob.Name) > validationutils.DNS1035LabelMaxLength-11 {
 		// The job name length is 63 characters like all Kubernetes objects

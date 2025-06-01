@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// 实现一个控制器来管理自定义的 CronJob CR（在 API group batch.tutorial.kubebuilder.io 下），该控制器的职责是根据用户定义的调度策略自动创建/清理 Job 资源。
+
 package controller
 
 import (
@@ -36,8 +38,11 @@ import (
 )
 
 // CronJobReconciler reconciles a CronJob object
+// 这是 Go 的嵌入式字段（Embedded Field），也叫匿名字段。它的意思是把 client.Client 这个接口或结构体直接嵌入到 CronJobReconciler 中。
+// 它的作用类似于“继承”（虽然 Go 没有继承这个词），会自动把 client.Client 的所有方法暴露在 CronJobReconciler 上。
+// 这样，CronJobReconciler 就拥有了 client.Client 的所有功能，比如 Get、List、Create、Update 等方法。
 type CronJobReconciler struct {
-	client.Client
+	client.Client // 这是 controller-runtime 库提供的一个接口，
 	Scheme *runtime.Scheme
 	Clock
 }
@@ -71,9 +76,14 @@ var (
 //
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.20.4/pkg/reconcile
+
+// controller-runtime 框架会自动调用你实现的 Reconcile 方法，前提是你用 SetupWithManager 注册了你的 Reconciler 实例。
 func (r *CronJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
+	// 1. 获取 CronJob 实例
+	// 通过 client 获取 CronJob 实例，失败就返回。若该资源已经被删除，会被 IgnoreNotFound 忽略。
+	// CronJob 实例就是用户在集群中创建的一个资源对象，通过 YAML 创建后，由 controller-runtime 的 client 获取并反序列化为对应的 Go 结构体。
 	var cronJob batchv1.CronJob
 	if err := r.Get(ctx, req.NamespacedName, &cronJob); err != nil {
 		log.Error(err, "unable to fetch CronJob")
@@ -83,6 +93,8 @@ func (r *CronJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	// 2. 列出属于该 CronJob 的所有 Job 子资源
+	// 使用 field index 快速查找所有以该 CronJob 作为 Controller 的 Job（在 SetupWithManager 中注册了 index）。
 	var childJobs kbatch.JobList
 	if err := r.List(ctx, &childJobs, client.InNamespace(req.Namespace), client.MatchingFields{jobOwnerKey: req.Name}); err != nil {
 		log.Error(err, "unable to list child Jobs")
@@ -117,6 +129,9 @@ func (r *CronJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 		return &timeParsed, nil
 	}
+
+	// 3. 分类 Job 并更新 CronJob.Status
+	// 遍历 childJobs.Items，按 JobConditionType 分类，并更新 CronJob.Status.Active 和 LastScheduleTime 字段。
 	for i, job := range childJobs.Items {
 		_, finishedType := isJobFinished(&job)
 		switch finishedType {
@@ -164,6 +179,9 @@ func (r *CronJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 
+	// 4. 根据 JobHistoryLimit 清理历史 Job
+	// 清理旧的 failed/successful Jobs，保留最近的几个，具体数目由 CronJob spec 中的限制字段控制。
+
 	// NB: deleting these are "best effort" -- if we fail on a particular one,
 	// we won't requeue just to finish the deleting.
 	if cronJob.Spec.FailedJobsHistoryLimit != nil {
@@ -204,11 +222,16 @@ func (r *CronJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 	}
 
+	// 5. 检查 CronJob 是否被暂停，如果被 Suspend 就退出，则跳过调度新的 Job
 	if cronJob.Spec.Suspend != nil && *cronJob.Spec.Suspend {
 		log.V(1).Info("cronjob suspended, skipping")
 		return ctrl.Result{}, nil
 	}
 
+	// 6. 计算 missedRun 和 nextRun
+	// 计算出最近一个“错过的”调度时间 missedRun
+	// 以及下一个要执行的时间 nextRun
+	// 如果错过次数太多（>100），就跳过防止爆炸
 	getNextSchedule := func(cronJob *batchv1.CronJob, now time.Time) (lastMissed time.Time, next time.Time, err error) {
 		sched, err := cron.ParseStandard(cronJob.Spec.Schedule)
 		if err != nil {
@@ -291,6 +314,11 @@ func (r *CronJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return scheduledResult, nil
 	}
 
+	// 7. 根据 ConcurrencyPolicy 控制 Job 创建行为
+	// •	ForbidConcurrent：当前有 active job 就不再调度
+	// •	ReplaceConcurrent：删除现有 active job，然后重新调度
+	// •	Allow：直接创建新的 job
+
 	// figure out how to run this job -- concurrency policy might forbid us from running
 	// multiple at the same time...
 	if cronJob.Spec.ConcurrencyPolicy == batchv1.ForbidConcurrent && len(activeJobs) > 0 {
@@ -309,6 +337,8 @@ func (r *CronJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 	}
 
+	// 8. 构建并创建新的 Job
+	// 生成 Job，并通过 SetControllerReference 设置 controller owner，最终调用 client 创建。
 	constructJobForCronJob := func(cronJob *batchv1.CronJob, scheduledTime time.Time) (*kbatch.Job, error) {
 		// We want job names for a given nominal start time to have a deterministic name to avoid the same job being created twice
 		name := fmt.Sprintf("%s-%d", cronJob.Name, scheduledTime.Unix())
@@ -360,6 +390,9 @@ var (
 	apiGVStr    = batchv1.GroupVersion.String()
 )
 
+// 注册 controller 和 field index
+// 注册 Reconciler 管理 CronJob 和它的 Job 子资源。
+// 为 .metadata.controller 创建 field index，以便高效查找。
 // SetupWithManager sets up the controller with the Manager.
 func (r *CronJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// set up a real clock, since we're not in a test
@@ -385,9 +418,17 @@ func (r *CronJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return err
 	}
 
+	// 注册控制器到 controller-runtime 框架，框架会框架会自动将这个类型注册进调度器并调用 Reconcile()，并指定要监听的资源类型（CronJob）和关联的 Job 资源。
+	// 这告诉 controller-runtime 框架：
+	// •	controller-runtime 内部维护一个工作队列（work queue）。
+	// •	当监听的资源（CronJob 或其拥有的 Job）发生变化时，就会将该对象的 NamespacedName 放入队列中。
+	// •	然后，框架会从队列中取出请求并调用：
+	// - 当 CronJob 资源发生变化时，调用 Reconcile 方法
+	// - 当 Job 资源被 CronJob 拥有时，也调用 Reconcile 方法
+	// - 使用名为 "cronjob" 的控制器名称，并使用你实现的 Reconciler 实例来处理这些资源的变化
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&batchv1.CronJob{}).
 		Owns(&kbatch.Job{}).
 		Named("cronjob").
-		Complete(r)
+		Complete(r) // Complete(r) 注册了 Reconciler 实例，并告诉框架如何获取和更新资源状态。
 }

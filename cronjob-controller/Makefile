@@ -139,6 +139,7 @@ ifndef ignore-not-found
   ignore-not-found = false
 endif
 
+# 只安装 CRDs，为自定义资源做准备
 .PHONY: install
 install: manifests kustomize ## Install CRDs into the K8s cluster specified in ~/.kube/config.
 	$(KUSTOMIZE) build config/crd | $(KUBECTL) apply -f -
@@ -147,6 +148,10 @@ install: manifests kustomize ## Install CRDs into the K8s cluster specified in ~
 uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
 	$(KUSTOMIZE) build config/crd | $(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -f -
 
+# 首先设置控制器的镜像名称
+# 使用 kustomize 构建 config/default 目录中的所有配置
+# 通过 kubectl 应用到集群中
+# 结果：部署完整的控制器应用，包括：Deployment（控制器 Pod） ServiceAccount RBAC 权限 CRDs 其他相关资源
 .PHONY: deploy
 deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
 	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
